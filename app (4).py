@@ -65,6 +65,21 @@ def _database_url():
         return None
 
 
+def _bootstrap_admins():
+    """Streamlit Secrets / env-la ADMIN_USERS = "mathi,ravi" nu irundha, andha usernames login panna Admin aagidum.
+    (Secrets-ah app owner mattum dhaan maathamudiyum, so idhu safe recovery vazhi.)"""
+    raw = os.environ.get("ADMIN_USERS")
+    if not raw:
+        try:
+            raw = st.secrets.get("ADMIN_USERS")
+        except Exception:
+            raw = None
+    if not raw:
+        return set()
+    items = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    return {str(i).strip().lower() for i in items if str(i).strip()}
+
+
 DATABASE_URL = _database_url()
 USE_PG = bool(DATABASE_URL)
 
@@ -993,6 +1008,9 @@ def main():
     _setup_once()
     uid = st.session_state.get("uid")
     user = get_user(uid) if uid else None
+    if user and user["role"] != "admin" and user["username"] in _bootstrap_admins():
+        update_user(user["id"], role="admin")
+        user = get_user(uid)
     if not user or not user["active"]:
         st.session_state.pop("uid", None)
         auth_screen()
