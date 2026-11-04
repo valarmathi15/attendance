@@ -1,0 +1,4 @@
+attendance.db
+__pycache__/
+.streamlit/secrets.toml
+*.pyc
