@@ -2,14 +2,14 @@
 🗓️ Attendance Portal - single file Streamlit app
 -------------------------------------------------
 Run locally :  streamlit run app.py
-Deploy      :  GitHub-la push panni Streamlit Community Cloud-la deploy pannunga.
+Deploy      :  Push to GitHub, then deploy on Streamlit Community Cloud.
 
 DATA STORAGE
-  * Default  : SQLite file (attendance.db)  -> local use-ku OK.
-               !! Streamlit Cloud-la file reset aagum (reboot / redeploy), so data poidum.
-  * Cloud    : Free Postgres (Supabase / Neon) URL-ah Streamlit "Secrets"-la podunga:
+  * Default  : SQLite file (attendance.db)  -> fine for local use.
+               !! On Streamlit Cloud the file system is reset on reboot / redeploy, so data is lost.
+  * Cloud    : Put a free Postgres (Supabase / Neon) URL in Streamlit "Secrets":
                    DATABASE_URL = "postgresql://user:password@host:5432/dbname"
-               Appo data permanent-ah irukkum.
+               Your data is then stored permanently.
 """
 import os
 import io
@@ -34,8 +34,8 @@ DEFAULT_SETTINGS = {
     "office_start": "09:30",      # office start time
     "grace_min": "15",            # grace minutes before "Late"
     "weekly_off": "6",            # Mon=0 ... Sun=6   (Sat+Sun => "5,6")
-    "allow_signup": "1",          # 1 = yaarum sign-up pannalam
-    "signup_code": "",            # set panna, sign-up-ku indha code venum
+    "allow_signup": "1",          # 1 = anyone can sign up
+    "signup_code": "",            # if set, sign-up requires this code
     "default_leave_quota": "12",  # per year
     "timezone": "Asia/Kolkata",
     "company": "My Office",
@@ -66,8 +66,8 @@ def _database_url():
 
 
 def _bootstrap_admins():
-    """Streamlit Secrets / env-la ADMIN_USERS = "mathi,ravi" nu irundha, andha usernames login panna Admin aagidum.
-    (Secrets-ah app owner mattum dhaan maathamudiyum, so idhu safe recovery vazhi.)"""
+    """If ADMIN_USERS = "mathi,ravi" is set in Streamlit Secrets (or env), those usernames become Admin on login.
+    Only the app owner can edit Secrets, so this is a safe recovery route."""
     raw = os.environ.get("ADMIN_USERS")
     if not raw:
         try:
@@ -231,13 +231,13 @@ def create_user(username, name, pin, role="employee", dept=""):
     username = (username or "").strip().lower()
     name = (name or "").strip()
     if not username or not name:
-        return False, "Name and username venum"
+        return False, "Name and username are required."
     if " " in username:
-        return False, "Username-la space irukka koodadhu"
+        return False, "Username cannot contain spaces."
     if len(pin or "") < 4:
-        return False, "PIN/password kuraintha 4 characters venum"
+        return False, "PIN / password must be at least 4 characters."
     if q("SELECT 1 AS k FROM users WHERE username=?", (username,), one=True):
-        return False, "Indha username already irukku"
+        return False, "This username is already taken."
     salt = secrets.token_hex(16)
     x("INSERT INTO users(username,name,salt,pin_hash,role,dept,created_at) VALUES(?,?,?,?,?,?,?)",
       (username, name, salt, _hash(pin, salt), role, (dept or "").strip(),
@@ -279,7 +279,7 @@ def update_user(uid, role=None, active=None, dept=None, quota=None, name=None, j
 
 def reset_pin(uid, new_pin):
     if len(new_pin or "") < 4:
-        return False, "PIN kuraintha 4 characters venum"
+        return False, "PIN must be at least 4 characters."
     salt = secrets.token_hex(16)
     x("UPDATE users SET salt=?, pin_hash=? WHERE id=?", (salt, _hash(new_pin, salt), uid))
     return True, "PIN changed"
@@ -334,17 +334,17 @@ def leave_days_count(start, end):
 
 def apply_leave(uid, start, end, ltype, reason):
     if end < start:
-        return False, "End date start date-ku munnadi irukka koodadhu"
+        return False, "End date cannot be before the start date."
     if leave_days_count(start, end) == 0:
-        return False, "Select panna naatkal ellam holiday/weekly-off"
+        return False, "All the selected days are holidays or weekly offs."
     dup = q("SELECT 1 AS k FROM leaves WHERE user_id=? AND status IN ('Pending','Approved') "
             "AND start_date<=? AND end_date>=?", (uid, end.isoformat(), start.isoformat()), one=True)
     if dup:
-        return False, "Indha dates-la already oru leave request irukku"
+        return False, "You already have a leave request overlapping these dates."
     x("INSERT INTO leaves(user_id,start_date,end_date,leave_type,reason,applied_at) VALUES(?,?,?,?,?,?)",
       (uid, start.isoformat(), end.isoformat(), ltype, (reason or "").strip(),
        now().isoformat(timespec="seconds")))
-    return True, "Leave request anuppiyachu"
+    return True, "Leave request submitted."
 
 
 def list_leaves(uid=None, status=None):
@@ -398,9 +398,9 @@ def check_in(uid, mode, note=""):
     d = today()
     rec = get_record(uid, d)
     if rec and rec["check_in"]:
-        return False, "Already check-in aayiduchu"
+        return False, "You have already checked in today."
     if d in _approved_leave_set(uid, d, d):
-        return False, "Indha naal unga leave approved. Venum na admin-kitta sollunga"
+        return False, "Your leave is approved for today. Please contact the admin if you need to check in."
     t = now().strftime("%H:%M:%S")
     _upsert(uid, d, mode, t, None, (note or "").strip())
     return True, f"Check-in {t[:5]}"
@@ -410,9 +410,9 @@ def check_out(uid):
     d = today()
     rec = get_record(uid, d)
     if not rec or not rec["check_in"]:
-        return False, "Munnadi check-in pannunga"
+        return False, "Please check in first."
     if rec["check_out"]:
-        return False, "Already check-out aayiduchu"
+        return False, "You have already checked out today."
     t = now().strftime("%H:%M:%S")
     _upsert(uid, d, rec["status"], rec["check_in"], t, rec["note"] or "")
     return True, f"Check-out {t[:5]}"
@@ -445,7 +445,7 @@ def _status_for(d, rec, leave_set, offs, hol, today_, joined=None):
     if rec:
         return rec["status"]
     if joined and d < joined:
-        return "-"          # account create aagum munnadi absent-nu kaattakoodadhu
+        return "-"          # do not show Absent for days before the account was created
     if _is_off(d, offs, hol):
         return "Off"
     if d in leave_set:
@@ -458,7 +458,7 @@ def _status_for(d, rec, leave_set, offs, hol, today_, joined=None):
 
 
 def days_between(uid, first, last):
-    """first..last (inclusive) naatkal-oda status list."""
+    """Day-by-day status list from first to last (inclusive)."""
     s = get_settings()
     offs = off_weekdays(s)
     recs = {r["date"]: r for r in q("SELECT * FROM attendance WHERE user_id=? AND date BETWEEN ? AND ?",
@@ -647,8 +647,8 @@ def kpi_row(sm):
 
 def storage_warning():
     if not USE_PG:
-        st.warning("⚠️ Temporary storage (SQLite) use aagudhu. Streamlit Cloud-la app reboot/redeploy "
-                   "aana data poidum. Permanent-ah vaikka Secrets-la `DATABASE_URL` (Postgres) set pannunga.")
+        st.warning("⚠️ This app is using temporary storage (SQLite). On Streamlit Cloud, data is lost when the app "
+                   "reboots or is redeployed. To keep data permanently, set `DATABASE_URL` (Postgres) in Secrets.")
 
 
 # =====================================================================
@@ -658,7 +658,7 @@ def auth_screen():
     s = get_settings()
     st.title(f"🗓️ {s['company']} - Attendance Portal")
     if user_count() == 0:
-        st.info("First-time setup: mudhal account **Admin** aagum.")
+        st.info("First-time setup: the first account you create will be the **Admin**.")
         storage_warning()
         with st.form("setup"):
             name = st.text_input("Full name")
@@ -669,7 +669,7 @@ def auth_screen():
                 ok, msg = create_user(username, name, pin, role="admin")
                 if ok:
                     set_setting("company", company)
-                    st.success("Admin ready. Ippo login pannunga.")
+                    st.success("Admin account created. Please log in now.")
                     st.rerun()
                 else:
                     st.error(msg)
@@ -686,7 +686,7 @@ def auth_screen():
                     st.session_state["uid"] = u["id"]
                     st.rerun()
                 else:
-                    st.error("Username / PIN thappu, illa account inactive")
+                    st.error("Incorrect username or PIN, or the account is inactive.")
     if len(tabs) > 1:
         with tabs[1]:
             with st.form("signup"):
@@ -697,10 +697,10 @@ def auth_screen():
                 code = st.text_input("Join code", type="password", key="su_code") if s["signup_code"] else ""
                 if st.form_submit_button("Create my account"):
                     if s["signup_code"] and code != s["signup_code"]:
-                        st.error("Join code thappu")
+                        st.error("Incorrect join code.")
                     else:
                         ok, msg = create_user(username, name, pin, dept=dept)
-                        (st.success if ok else st.error)(msg + (" - Login tab-la login pannunga" if ok else ""))
+                        (st.success if ok else st.error)(msg + (" You can now log in from the Login tab." if ok else ""))
 
 
 def page_my_day(u):
@@ -708,20 +708,20 @@ def page_my_day(u):
     d = t.date()
     rec = get_record(u["id"], d)
     s = get_settings()
-    st.header(f"Vanakkam, {u['name']} 👋")
+    st.header(f"Welcome, {u['name']} 👋")
     st.caption(t.strftime("%A, %d %B %Y  |  %I:%M %p"))
 
     off = d.weekday() in off_weekdays(s) or any(h["date"] == d.isoformat() for h in list_holidays())
     if off and not rec:
-        st.info("Inniku weekly off / holiday 🎉 (venum na check-in pannalam)")
+        st.info("Today is a weekly off or holiday 🎉 (you can still check in if you are working).")
     leave_today = d in _approved_leave_set(u["id"], d, d)
     if leave_today and not rec:
-        st.warning("Inniku unga leave approved 🌴")
+        st.warning("Your leave is approved for today 🌴")
 
     with st.container(border=True):
         if not rec or not rec["check_in"]:
             st.subheader("Check-in")
-            mode = st.radio("Inniku enga irundhu velai?", ["Office 🏢", "Work From Home 🏠"], horizontal=True)
+            mode = st.radio("Where are you working from today?", ["Office 🏢", "Work From Home 🏠"], horizontal=True)
             note = st.text_input("Note (optional)", placeholder="e.g. client visit, doctor appointment...")
             if st.button("✅ Check in now", type="primary", disabled=leave_today):
                 ok, msg = check_in(u["id"], "Present" if mode.startswith("Office") else "WFH", note)
@@ -814,7 +814,7 @@ def page_leaves(u):
     st.subheader("My requests")
     rows = list_leaves(uid=u["id"])
     if not rows:
-        st.caption("Innum leave request illa")
+        st.caption("You have not made any leave requests yet.")
     for r in rows:
         col = {"Pending": "#f9a825", "Approved": "#2e7d32", "Rejected": "#c62828"}[r["status"]]
         with st.container(border=True):
@@ -831,7 +831,7 @@ def page_board(u):
     d = st.date_input("Date", value=today())
     df = pd.DataFrame(board(d))
     if df.empty:
-        st.info("Users illa")
+        st.info("No users found.")
         return
     c = st.columns(6)
     c[0].metric("🏢 In office", int((df.Status == "Present").sum()))
@@ -854,7 +854,7 @@ def page_leaderboard(u):
     y, m = month_year_picker("lb")
     df = leaderboard(y, m)
     if df.empty:
-        st.info("Data illa")
+        st.info("No data available.")
         return
     medals = ["🥇", "🥈", "🥉"]
     top = df.head(3)
@@ -872,7 +872,7 @@ def page_admin(u):
     with tabs[0]:
         pend = list_leaves(status="Pending")
         if not pend:
-            st.success("Pending requests illa 👍")
+            st.success("No pending requests 👍")
         for r in pend:
             with st.container(border=True):
                 a, b, c = st.columns([5, 1, 1])
@@ -910,7 +910,7 @@ def page_admin(u):
             st.success("Saved")
 
     with tabs[2]:
-        st.caption("Role / quota / joining date maathalaam")
+        st.caption("You can change role, leave quota and joining date here.")
         for x_ in list_users():
             with st.expander(f"{x_['name']} (@{x_['username']}) - {x_['role']}{'' if x_['active'] else ' [inactive]'}"):
                 c = st.columns(4)
@@ -924,7 +924,7 @@ def page_admin(u):
                 c1, c2 = st.columns(2)
                 if c1.button("Update", key=f"up{x_['id']}"):
                     if x_["id"] == u["id"] and (role != "admin" or not active):
-                        st.error("Neenga unga admin access-ah remove panna koodadhu")
+                        st.error("You cannot remove your own admin access.")
                     else:
                         update_user(x_["id"], role=role, active=active, dept=dept, quota=quota, joined=joined)
                         st.success("Updated")
@@ -962,7 +962,7 @@ def page_admin(u):
                                     value=float(s["default_leave_quota"]), step=0.5)
             tz = st.text_input("Timezone", value=s["timezone"])
             signup = st.checkbox("Anyone can sign up", value=s["allow_signup"] == "1")
-            code = st.text_input("Sign-up join code (optional - set panna, kodukkaravanga mattum join aaga mudiyum)",
+            code = st.text_input("Sign-up join code (optional - if set, only people who know the code can sign up)",
                                  value=s["signup_code"])
             if st.form_submit_button("Save settings"):
                 set_setting("company", company)
