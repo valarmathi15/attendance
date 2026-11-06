@@ -16,7 +16,10 @@ import io
 import sqlite3
 import hashlib
 import secrets
+import hmac
+import smtplib
 import calendar
+from email.message import EmailMessage
 from datetime import datetime, date, time, timedelta, timezone
 
 import pandas as pd
@@ -36,6 +39,7 @@ DEFAULT_SETTINGS = {
     "weekly_off": "6",            # Mon=0 ... Sun=6   (Sat+Sun => "5,6")
     "allow_signup": "1",          # 1 = anyone can sign up
     "signup_code": "",            # if set, sign-up requires this code
+    "approver_email": "",         # leave requests are emailed here (comma separated for more than one)
     "default_leave_quota": "12",  # per year
     "timezone": "Asia/Kolkata",
     "company": "My Office",
@@ -63,6 +67,86 @@ def _database_url():
         return st.secrets.get("DATABASE_URL")
     except Exception:
         return None
+
+
+def _secret(name):
+    """Read a value from environment variables or Streamlit Secrets."""
+    v = os.environ.get(name)
+    if v:
+        return str(v)
+    try:
+        v = st.secrets.get(name)
+    except Exception:
+        v = None
+    return str(v) if v else ""
+
+
+def send_mail(to, subject, html):
+    """Send an HTML email through SMTP (Gmail by default). Never raises."""
+    user, pw = _secret("SMTP_USER"), _secret("SMTP_PASSWORD").replace(" ", "")
+    if not user or not pw:
+        return False, "Email is not configured (SMTP_USER / SMTP_PASSWORD missing in Secrets)."
+    host = _secret("SMTP_HOST") or "smtp.gmail.com"
+    port = int(_secret("SMTP_PORT") or 465)
+    msg = EmailMessage()
+    msg["From"] = _secret("SMTP_FROM") or user
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg.set_content("Please open this email in a client that supports HTML.")
+    msg.add_alternative(html, subtype="html")
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=20) as srv:
+                srv.login(user, pw)
+                srv.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=20) as srv:
+                srv.starttls()
+                srv.login(user, pw)
+                srv.send_message(msg)
+        return True, "Email sent."
+    except Exception as e:
+        return False, f"Email could not be sent ({type(e).__name__})."
+
+
+def leave_token(leave_id):
+    """Signed token so the approver can open a review link straight from the email."""
+    key = _secret("APPROVAL_SECRET")
+    if not key:
+        return ""
+    return hmac.new(key.encode(), f"leave:{leave_id}".encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def approver_emails():
+    raw = get_settings().get("approver_email") or _secret("APPROVER_EMAIL")
+    return [e.strip() for e in raw.replace(";", ",").split(",") if e.strip()]
+
+
+def notify_leave_request(leave_id):
+    """Email the approver about a new leave request. Returns (sent, message) or (None, '') if no approver set."""
+    to = approver_emails()
+    if not to:
+        return None, ""
+    r = next((l for l in list_leaves(status="Pending") if l["id"] == leave_id), None)
+    if not r:
+        return None, ""
+    n = leave_days_count(date.fromisoformat(r["start_date"]), date.fromisoformat(r["end_date"]))
+    tok, base = leave_token(leave_id), _secret("APP_URL").rstrip("/")
+    if tok and base:
+        link = f"{base}/?leave={leave_id}&token={tok}"
+        action = (f"<p><a href='{link}' style='background:#2e7d32;color:#fff;padding:10px 18px;"
+                  f"border-radius:6px;text-decoration:none'>Review &amp; approve / reject</a></p>")
+    else:
+        action = "<p>Please open the Attendance Portal and use <b>Admin → Leave approvals</b> to decide.</p>"
+    html = (f"<h3>New leave request</h3>"
+            f"<p><b>{r['name']}</b> ({r['dept'] or '-'}) has requested leave.</p>"
+            f"<table cellpadding='4'>"
+            f"<tr><td>From</td><td><b>{r['start_date']}</b></td></tr>"
+            f"<tr><td>To</td><td><b>{r['end_date']}</b></td></tr>"
+            f"<tr><td>Working days</td><td>{n}</td></tr>"
+            f"<tr><td>Type</td><td>{r['leave_type']}</td></tr>"
+            f"<tr><td>Reason</td><td>{r['reason'] or '-'}</td></tr></table>{action}")
+    return send_mail(",".join(to), f"Leave request: {r['name']} ({r['start_date']} to {r['end_date']})", html)
 
 
 def _bootstrap_admins():
@@ -344,6 +428,13 @@ def apply_leave(uid, start, end, ltype, reason):
     x("INSERT INTO leaves(user_id,start_date,end_date,leave_type,reason,applied_at) VALUES(?,?,?,?,?,?)",
       (uid, start.isoformat(), end.isoformat(), ltype, (reason or "").strip(),
        now().isoformat(timespec="seconds")))
+    row = q("SELECT id FROM leaves WHERE user_id=? AND start_date=? AND end_date=? AND status='Pending' "
+            "ORDER BY id DESC", (uid, start.isoformat(), end.isoformat()), one=True)
+    sent, _ = notify_leave_request(row["id"]) if row else (None, "")
+    if sent is True:
+        return True, "Leave request submitted. The approver has been notified by email."
+    if sent is False:
+        return True, "Leave request submitted, but the email to the approver could not be sent."
     return True, "Leave request submitted."
 
 
@@ -627,6 +718,14 @@ def to_excel(df, sheet="Report"):
     return buf.getvalue()
 
 
+def download_table(label, df, file_base, sheet="Report"):
+    """Excel download; falls back to CSV if the Excel library is not installed."""
+    try:
+        st.download_button(f"⬇️ {label} (Excel)", to_excel(df, sheet), file_name=f"{file_base}.xlsx")
+    except ImportError:
+        st.download_button(f"⬇️ {label} (CSV)", df.to_csv(index=False), file_name=f"{file_base}.csv")
+
+
 def month_year_picker(key):
     t = today()
     c1, c2 = st.columns(2)
@@ -784,8 +883,7 @@ def page_my_attendance(u):
     } for d in days])
     with st.expander("Detailed table"):
         st.dataframe(df, hide_index=True)
-    st.download_button("⬇️ Download (Excel)", to_excel(df, "My Attendance"),
-                       file_name=f"attendance_{u['username']}_{y}_{m:02d}.xlsx")
+    download_table("Download", df, f"attendance_{u['username']}_{y}_{m:02d}", "My Attendance")
 
 
 def page_leaves(u):
@@ -871,8 +969,7 @@ def page_colleagues(u):
             })
         df = pd.DataFrame(rows)
         st.dataframe(df, hide_index=True)
-        st.download_button("⬇️ Download (Excel)", to_excel(df, f"{MONTHS[m - 1]} {y}"),
-                           file_name=f"team_summary_{y}_{m:02d}.xlsx")
+        download_table("Download", df, f"team_summary_{y}_{m:02d}", f"{MONTHS[m - 1]} {y}")
 
     with tab_one:
         labels = {f"{x_['name']} ({x_['dept'] or '-'})": x_ for x_ in users}
@@ -1009,6 +1106,8 @@ def page_admin(u):
             signup = st.checkbox("Anyone can sign up", value=s["allow_signup"] == "1")
             code = st.text_input("Sign-up join code (optional - if set, only people who know the code can sign up)",
                                  value=s["signup_code"])
+            approver = st.text_input("Leave approver email(s) - new leave requests are emailed here "
+                                     "(separate several with commas)", value=s["approver_email"])
             if st.form_submit_button("Save settings"):
                 set_setting("company", company)
                 set_setting("office_start", start.strftime("%H:%M"))
@@ -1018,15 +1117,23 @@ def page_admin(u):
                 set_setting("timezone", tz)
                 set_setting("allow_signup", "1" if signup else "0")
                 set_setting("signup_code", code.strip())
+                set_setting("approver_email", approver.strip())
                 st.success("Saved")
+        if st.button("Send a test email to the approver"):
+            to = approver_emails()
+            if not to:
+                st.error("Please set the approver email first.")
+            else:
+                ok, msg = send_mail(",".join(to), "Attendance Portal - test email",
+                                    "<p>This is a test email from your Attendance Portal.</p>")
+                (st.success if ok else st.error)(msg)
 
     with tabs[5]:
         y, m = month_year_picker("rep")
         df = muster(y, m)
         st.dataframe(df, hide_index=True)
         st.caption("P = Office, W = WFH, HD = Half day, L = Leave, A = Absent, Off = holiday/weekly off")
-        st.download_button("⬇️ Monthly muster (Excel)", to_excel(df, f"{MONTHS[m - 1]} {y}"),
-                           file_name=f"muster_{y}_{m:02d}.xlsx")
+        download_table("Monthly muster", df, f"muster_{y}_{m:02d}", f"{MONTHS[m - 1]} {y}")
         rows = q("SELECT u.name, a.date, a.status, a.check_in, a.check_out, a.note FROM attendance a "
                  "JOIN users u ON u.id=a.user_id ORDER BY a.date DESC, u.name")
         st.download_button("⬇️ All raw records (CSV)", pd.DataFrame(rows).to_csv(index=False),
@@ -1048,9 +1155,45 @@ PAGES = {
 }
 
 
+def leave_review_page(params):
+    """Opened from the link in the approver's email. The signed token is the authorisation."""
+    st.title("Leave request review")
+    try:
+        lid = int(params.get("leave", ""))
+    except ValueError:
+        st.error("This link is not valid.")
+        return
+    tok, expected = str(params.get("token", "")), leave_token(lid)
+    if not expected or not hmac.compare_digest(tok, expected):
+        st.error("This link is not valid or has expired.")
+        return
+    r = next((l for l in list_leaves() if l["id"] == lid), None)
+    if not r:
+        st.error("This leave request no longer exists.")
+        return
+    n = leave_days_count(date.fromisoformat(r["start_date"]), date.fromisoformat(r["end_date"]))
+    with st.container(border=True):
+        st.markdown(f"**{r['name']}** ({r['dept'] or '-'})  \n{r['start_date']} → {r['end_date']} "
+                    f"({n} working day(s)) | {r['leave_type']}  \n_{r['reason'] or '-'}_")
+    if r["status"] != "Pending":
+        st.info(f"This request is already **{r['status']}**.")
+        return
+    c1, c2 = st.columns(2)
+    if c1.button("✅ Approve", type="primary"):
+        decide_leave(lid, "Approved", None)
+        st.success("Leave approved.")
+    if c2.button("❌ Reject"):
+        decide_leave(lid, "Rejected", None)
+        st.success("Leave rejected.")
+
+
 def main():
     st.set_page_config(page_title="Attendance Portal", page_icon="🗓️", layout="wide")
     _setup_once()
+    params = st.query_params
+    if params.get("leave"):
+        leave_review_page(params)
+        return
     uid = st.session_state.get("uid")
     user = get_user(uid) if uid else None
     if user and user["role"] != "admin" and user["username"] in _bootstrap_admins():
