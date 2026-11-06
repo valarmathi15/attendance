@@ -849,6 +849,51 @@ def page_board(u):
     st.button("🔄 Refresh")
 
 
+def page_colleagues(u):
+    """Read-only view of every colleague's attendance. No admin rights needed."""
+    st.header("🧑‍🤝‍🧑 Colleagues")
+    st.caption("Read-only view of your team's attendance. Only attendance details are shown.")
+    y, m = month_year_picker("col")
+    users = list_users(active_only=True)
+    if not users:
+        st.info("No users found.")
+        return
+    tab_all, tab_one = st.tabs(["Everyone - monthly summary", "Individual - day by day"])
+
+    with tab_all:
+        rows = []
+        for x_ in users:
+            sm = summarize(month_days(x_["id"], y, m))
+            rows.append({
+                "Name": x_["name"], "Dept": x_["dept"] or "-", "Office": sm["Present"], "WFH": sm["WFH"],
+                "Half Day": sm["Half Day"], "Leave": sm["Leave Days"], "Absent": sm["Absent"],
+                "Late": sm["Late"], "Total Hours": sm["Hours"], "Avg In-time": sm["Avg In"] or "-",
+            })
+        df = pd.DataFrame(rows)
+        st.dataframe(df, hide_index=True)
+        st.download_button("⬇️ Download (Excel)", to_excel(df, f"{MONTHS[m - 1]} {y}"),
+                           file_name=f"team_summary_{y}_{m:02d}.xlsx")
+
+    with tab_one:
+        labels = {f"{x_['name']} ({x_['dept'] or '-'})": x_ for x_ in users}
+        who = st.selectbox("Colleague", list(labels))
+        person = labels[who]
+        days = month_days(person["id"], y, m)
+        sm = summarize(days)
+        kpi_row(sm)
+        st.markdown(calendar_html(days, y, m), unsafe_allow_html=True)
+        st.markdown(" ".join(badge(k, v) for k, v in COLORS.items() if k != "-"), unsafe_allow_html=True)
+        df = pd.DataFrame([{
+            "Date": d["date"].strftime("%d-%m-%Y"), "Day": d["date"].strftime("%a"),
+            "Status": d["status"] + (f" ({d['holiday']})" if d["holiday"] else ""),
+            "In": (d["check_in"] or "")[:5], "Out": (d["check_out"] or "")[:5],
+            "Hours": d["hours"] if d["hours"] is not None else "",
+            "Late": "Late" if d["late"] else "",
+        } for d in days])
+        with st.expander("Detailed table"):
+            st.dataframe(df, hide_index=True)
+
+
 def page_leaderboard(u):
     st.header("🏆 Punctuality Leaderboard")
     y, m = month_year_picker("lb")
@@ -999,7 +1044,7 @@ def _setup_once():
 
 PAGES = {
     "🏠 My Day": page_my_day, "📅 My Attendance": page_my_attendance, "🌴 Leaves": page_leaves,
-    "👥 Today's Board": page_board, "🏆 Leaderboard": page_leaderboard, "🛠️ Admin": page_admin,
+    "👥 Today's Board": page_board, "🧑‍🤝‍🧑 Colleagues": page_colleagues, "🏆 Leaderboard": page_leaderboard, "🛠️ Admin": page_admin,
 }
 
 
